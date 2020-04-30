@@ -12,7 +12,7 @@
  * http://polymer.github.io/PATENTS.txt
  */
 
-import {AttributePart, BooleanAttributePart, NodePart, PropertyPart} from './parts.js';
+import {AttributePart, BooleanAttributePart, isIterable, NodePart, PropertyPart} from './parts.js';
 import {RenderOptions} from './render-options.js';
 import {parts} from './render.js';
 import {templateFactory} from './template-factory.js';
@@ -27,11 +27,19 @@ import {TemplateResult} from './template-result.js';
  * NodeParts for that.
  */
 type NodePartState = {
-  container: false;
+  type: 'leaf';
   /** The NodePart that the result is rendered to */
   part: NodePart;
 }|{
-  container: true;
+  type: 'iterable';
+  /** The NodePart that the result is rendered to */
+  part: NodePart;
+  value: Iterable<unknown>;
+  iterator: Iterator<unknown>;
+  done: boolean;
+}
+|{
+  type: 'template-instance';
   /** The NodePart that the result is rendered to */
   part: NodePart;
 
@@ -142,7 +150,7 @@ export const hydrate =
           } else {
             const state = stack[stack.length - 1];
 
-            if (state.container) {
+            if (state.type === 'template-instance') {
               // We have a current template instace, so use its template
               // processor to create parts
               currentNodePart =
@@ -150,6 +158,17 @@ export const hydrate =
               state.instance.__parts.push(currentNodePart);
               value = state.result.values[state.currentPartIndex];
               state.currentPartIndex++;
+            } else if (state.type === 'iterable') {
+              const result = state.iterator.next();
+              if (result.done) {
+                value = undefined;
+                state.done = true;
+                throw new Error('Unhandled shorter than expected iterable');
+              } else {
+                value = result.value;
+              }
+              currentNodePart = new NodePart(options);
+              (state.part.value as Array<NodePart>).push(currentNodePart);
             } else {
               // TODO: use the closest TemplateInstance's template processor
               currentNodePart = new NodePart(options);
@@ -168,7 +187,7 @@ export const hydrate =
               const instance =
                   new TemplateInstance(template, value.processor, options);
               stack.push({
-                container: true,
+                type: 'template-instance',
                 instance,
                 part: currentNodePart,
                 currentPartIndex: 0,
@@ -183,11 +202,23 @@ export const hydrate =
               throw new Error('unimplemented');
             }
           } else {
-            stack.push({part: currentNodePart, container: false});
             if (typeof value === 'string') {
               // TODO: implement the rest of the NodePart commit() cascade. Can
               // we reuse the code?
+              stack.push({part: currentNodePart, type: 'leaf'});
               currentNodePart.value = value;
+            } else if (isIterable(value)) {
+              // currentNodePart.value will contain an array of NodeParts
+              stack.push({
+                part: currentNodePart,
+                type: 'iterable',
+                value,
+                iterator: value[Symbol.iterator](),
+                done: false,
+              });
+              currentNodePart.value = [];
+            } else {
+              stack.push({part: currentNodePart, type: 'leaf'});
             }
           }
         } else if (data.startsWith('/lit-part')) {
@@ -198,6 +229,13 @@ export const hydrate =
           currentNodePart.endNode = node;
 
           const currentState = stack.pop()!;
+
+          if (currentState.type === 'iterable') {
+            if (!currentState.iterator.next().done) {
+              throw new Error('unexpected longer than expected iterable');
+            }
+          }
+
           // If we empty the stack, make sure the last state is for the root
           // part
           if (stack.length === 0) {
@@ -217,13 +255,14 @@ export const hydrate =
           const nodeIndex = parseInt(match[1]);
 
           const state = stack[stack.length - 1];
-          if (state.container) {
+          if (state.type === 'template-instance') {
             const instance = state.instance;
             let foundOnePart = false;
             // eslint-disable-next-line no-constant-condition
             while (true) {
               const part = instance.template.parts[state.currentPartIndex];
-              if (part === undefined || part.type !== 'attribute' || part.index !== nodeIndex) {
+              if (part === undefined || part.type !== 'attribute' ||
+                  part.index !== nodeIndex) {
                 break;
               }
               foundOnePart = true;
@@ -240,13 +279,14 @@ export const hydrate =
                 (attributePart as any).value =
                     state.result.values[state.currentPartIndex];
 
-                // Set the part's current value, but only for AttributeParts, not
-                // PropertyParts. This is because properties are not represented
-                // in DOM so we do need to set them on initial render.
+                // Set the part's current value, but only for AttributeParts,
+                // not PropertyParts. This is because properties are not
+                // represented in DOM so we do need to set them on initial
+                // render.
 
                 // TODO: only do this if we definitely have the same data as on
-                // the server. We need a flag like `dataChanged` or `sameData` for
-                // this.
+                // the server. We need a flag like `dataChanged` or `sameData`
+                // for this.
                 if (attributePart instanceof AttributePart &&
                     !(attributePart instanceof PropertyPart)) {
                   attributePart.committer.dirty = false;
